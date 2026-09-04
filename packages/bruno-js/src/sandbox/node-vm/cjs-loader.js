@@ -38,6 +38,40 @@ const sharedNpmModuleCache = new Map();
 let sharedNpmSandbox = null;
 let sharedNpmContext = null;
 
+// Runtime detection of context-sensitive modules (no static source scan).
+// A module is "context-sensitive" if it *reads* a Bruno global (bru/req/res/…)
+// while it is being loaded — e.g. `const urlAtLoad = req.getUrl()` at top level.
+// Such a module captures per-request state at load time, so it cannot be shared:
+// it must be re-evaluated in each script context. Everything else (faker, lodash,
+// …) is evaluated once and shared. `moduleLoadStack` holds a frame per module
+// currently being evaluated; when the context-global getter fires, every frame on
+// the stack is flagged, giving transitive sensitivity (a parent that requires a
+// sensitive child is itself sensitive).
+const moduleLoadStack = [];
+const contextSensitiveModules = new Set();
+
+function markModuleLoadTouchedContext() {
+  for (const frame of moduleLoadStack) {
+    frame.sensitive = true;
+  }
+}
+
+// Per-script-context cache for context-sensitive modules, hung off the active
+// script context object so each run re-evaluates them with its own bru/req/res.
+const perContextModuleCaches = new WeakMap();
+function getPerContextModuleCache() {
+  const store = activeScriptContext.getStore();
+  if (!store) {
+    return null;
+  }
+  let cache = perContextModuleCaches.get(store);
+  if (!cache) {
+    cache = new Map();
+    perContextModuleCaches.set(store, cache);
+  }
+  return cache;
+}
+
 // Keys that scripts get from Bruno rather than from the host: always exposed as
 // dynamic accessors on the shared context (extended on the fly by runWithScriptContext).
 const BRUNO_CONTEXT_KEYS = [
@@ -149,6 +183,11 @@ function defineDynamicGlobal(key) {
     enumerable: true,
     configurable: true,
     get: () => {
+      // A module reading a Bruno global while loading captures per-request state;
+      // flag it (and its ancestors) so it is re-evaluated per run rather than shared.
+      if (moduleLoadStack.length > 0) {
+        markModuleLoadTouchedContext();
+      }
       // A key the current execution does not provide reads as undefined, exactly
       // as it would inside the script's own context (e.g. `res` before a response).
       const value = activeScriptContext.getStore()?.[key];
@@ -404,9 +443,16 @@ function executeModuleInVmContext({
   moduleName,
   collectionPath
 }) {
-  // Check cache - we cache moduleObj, return its exports
+  // Shareable modules: evaluated once, reused across every run.
   if (sharedNpmModuleCache.has(resolvedPath)) {
     return sharedNpmModuleCache.get(resolvedPath).exports;
+  }
+
+  // Context-sensitive modules: re-evaluated per run so load-time captures of
+  // bru/req/res reflect the current request; cached only within this run.
+  const perContextCache = getPerContextModuleCache();
+  if (contextSensitiveModules.has(resolvedPath) && perContextCache && perContextCache.has(resolvedPath)) {
+    return perContextCache.get(resolvedPath).exports;
   }
 
   // Native modules (.node files) - fall back to host require
@@ -433,16 +479,24 @@ function executeModuleInVmContext({
   const moduleDir = path.dirname(resolvedPath);
   const moduleObj = { exports: {} };
 
+  // Already known context-sensitive: evaluate into the per-run cache.
+  // Otherwise evaluate tentatively in the shared cache and watch, via the load
+  // stack, whether it reads a Bruno global; if it does, reclassify it.
+  const knownSensitive = contextSensitiveModules.has(resolvedPath);
+  const targetCache = knownSensitive && perContextCache ? perContextCache : sharedNpmModuleCache;
+
   // Pre-populate cache with moduleObj BEFORE execution to handle circular dependencies
   // This allows re-entrant requires to get partial exports (Node.js behavior)
   // We cache moduleObj (not moduleObj.exports) so that module.exports reassignment works
-  sharedNpmModuleCache.set(resolvedPath, moduleObj);
+  targetCache.set(resolvedPath, moduleObj);
 
   const moduleRequire = createNpmModuleRequire({
     collectionPath,
     currentModuleDir: moduleDir
   });
 
+  const frame = { sensitive: false };
+  moduleLoadStack.push(frame);
   try {
     // Wrap module code in a function that receives CJS parameters
     const wrappedCode = `(function(module, exports, require, __filename, __dirname) {\n${moduleSource}\n})`;
@@ -451,9 +505,21 @@ function executeModuleInVmContext({
     moduleFunction(moduleObj, moduleObj.exports, moduleRequire, resolvedPath, moduleDir);
   } catch (error) {
     // Remove failed module from cache to allow retry
-    sharedNpmModuleCache.delete(resolvedPath);
+    targetCache.delete(resolvedPath);
+    moduleLoadStack.pop();
     const stack = error.stack || '';
     throw new Error(`Error loading module ${moduleName}: ${error.message}\nStack: ${stack}`);
+  }
+  moduleLoadStack.pop();
+
+  // Newly discovered as context-sensitive: it must not stay in the shared cache.
+  // Move this run's instance into the per-run cache so later runs re-evaluate it.
+  if (frame.sensitive && !knownSensitive) {
+    contextSensitiveModules.add(resolvedPath);
+    sharedNpmModuleCache.delete(resolvedPath);
+    if (perContextCache) {
+      perContextCache.set(resolvedPath, moduleObj);
+    }
   }
 
   return moduleObj.exports;
